@@ -3,3 +3,4 @@ pandas
 pillow
 plotly
 openpyxl
+streamlit-autorefresh
