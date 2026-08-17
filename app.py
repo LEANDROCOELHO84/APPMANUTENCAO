@@ -1,72 +1,93 @@
-import streamlit as st
-import pandas as pd
-from datetime import datetime, timedelta
+"""
+Gestão de Chamados e Manutenção — interface Streamlit.
+Lógica de dados em database.py | tema em theme.py
+"""
 import os
-import logging
-from logging.handlers import RotatingFileHandler
+from datetime import datetime, timedelta
 from pathlib import Path
-from PIL import Image, ImageOps
+
+import pandas as pd
 import plotly.express as px
-import hashlib
+import streamlit as st
 from streamlit_autorefresh import st_autorefresh
 
-# ====================== LOGGING ======================
-LOG_DIR = Path("logs")
-LOG_DIR.mkdir(exist_ok=True)
+from database import (
+    # feedback
+    efeito_concluido,
+    agendar_efeito_concluido,
+    _mostrar_efeito_pendente,
+    log_error,
+    logger,
+    # conexão / init
+    init_db,
+    is_cloud,
+    get_connection_string,
+    sync_local_to_cloud,
+    # chamados
+    carregar_dados,
+    salvar_chamado,
+    proximo_id_chamado,
+    # equipe / setores / equipamentos
+    carregar_equipe,
+    adicionar_membro_equipe,
+    excluir_membro_equipe,
+    carregar_setores,
+    salvar_setores,
+    carregar_equipamentos,
+    salvar_equipamento,
+    excluir_equipamento,
+    proximo_id_equipamento,
+    nome_equipamento,
+    # manutenção
+    carregar_historico_manutencao,
+    salvar_manutencao,
+    proximo_id_manutencao,
+    concluir_preventiva,
+    adiar_alerta_preventiva,
+    custo_e_horas_por_equipamento,
+    # compras
+    carregar_compras,
+    carregar_compras_por_chamado,
+    historico_compras_item,
+    criar_solicitacao_compra_do_chamado,
+    salvar_compra,
+    _notificar_chamado_compra,
+    # util
+    parse_datetime_safe,
+    comprimir_imagem,
+    reload_data,
+    verificar_login_admin,
+)
 
-def setup_logger():
-    logger = logging.getLogger("chamados_app")
-    if logger.handlers:
-        return logger
-    logger.setLevel(logging.INFO)
-    formatter = logging.Formatter(
-        "%(asctime)s | %(levelname)s | %(funcName)s | %(message)s",
-        datefmt="%Y-%m-%d %H:%M:%S",
-    )
-    # Arquivo rotativo (máx 2 MB, 5 backups)
-    fh = RotatingFileHandler(
-        LOG_DIR / "app_errors.log",
-        maxBytes=2_000_000,
-        backupCount=5,
-        encoding="utf-8",
-    )
-    fh.setLevel(logging.INFO)
-    fh.setFormatter(formatter)
-    logger.addHandler(fh)
-
-    # Também no console (útil no Streamlit Cloud logs)
-    ch = logging.StreamHandler()
-    ch.setLevel(logging.WARNING)
-    ch.setFormatter(formatter)
-    logger.addHandler(ch)
-    return logger
-
-logger = setup_logger()
-
-def log_error(msg: str, exc: Exception | None = None):
-    if exc:
-        logger.exception("%s | %s", msg, exc)
-    else:
-        logger.error(msg)
-
-# ====================== TEMA ======================
 try:
-    from theme import aplicar_tema, header, badge_prioridade, badge_status, CORES_PRIORIDADE, CORES_STATUS
+    from theme import (
+        aplicar_tema,
+        header,
+        badge_prioridade,
+        badge_status,
+        CORES_PRIORIDADE,
+        CORES_STATUS,
+    )
 except ImportError:
     st.warning("Arquivo theme.py não encontrado. Usando tema padrão.")
-    def aplicar_tema(): pass
-    def header(title, subtitle="", icon="🏭"):
+
+    def aplicar_tema():
+        pass
+
+    def header(title, subtitle="", icon="🏭", nivel="principal"):
         st.title(f"{icon} {title}")
         if subtitle:
             st.markdown(f"_{subtitle}_")
+
     def badge_prioridade(prio):
         return f"**{prio}**"
+
     def badge_status(status):
         return f"**{status}**"
+
     CORES_PRIORIDADE = {}
     CORES_STATUS = {}
 
-# ====================== CONFIGURAÇÃO ======================
 st.set_page_config(
     page_title="Gestão de Chamados Integrada",
     layout="wide",
@@ -74,855 +95,7 @@ st.set_page_config(
     initial_sidebar_state="collapsed",
 )
 aplicar_tema()
-
 Path("fotos_chamados").mkdir(exist_ok=True)
-
-# ====================== CONEXÃO HÍBRIDA (LOCAL + SQLITE CLOUD) ======================
-def get_connection_string() -> str | None:
-    """
-    Retorna a URL do SQLite Cloud se configurada, senão None (modo local).
-
-    Aceita:
-      - SQLITECLOUD_URL no TOPO do secrets.toml  (recomendado)
-      - SQLITECLOUD_URL dentro de [admin]        (erro comum de TOML)
-      - variável de ambiente SQLITECLOUD_URL
-    """
-    # 1) Topo do secrets
-    try:
-        url = st.secrets.get("SQLITECLOUD_URL")
-        if url and str(url).strip():
-            return str(url).strip()
-    except Exception:
-        pass
-
-    # 2) Dentro de [admin] (chave colocada sob a seção por engano no TOML)
-    try:
-        admin = st.secrets.get("admin", {})
-        if admin is not None:
-            url = admin.get("SQLITECLOUD_URL") if hasattr(admin, "get") else None
-            if url and str(url).strip():
-                logger.warning(
-                    "SQLITECLOUD_URL lida de [admin]. Mova a chave para o TOPO do secrets.toml."
-                )
-                return str(url).strip()
-    except Exception:
-        pass
-
-    try:
-        url = st.secrets["admin"]["SQLITECLOUD_URL"]
-        if url and str(url).strip():
-            logger.warning(
-                "SQLITECLOUD_URL lida de [admin]. Mova a chave para o TOPO do secrets.toml."
-            )
-            return str(url).strip()
-    except Exception:
-        pass
-
-    # 3) Variável de ambiente
-    url = os.getenv("SQLITECLOUD_URL")
-    if url and url.strip():
-        return url.strip()
-
-    logger.info("SQLITECLOUD_URL não encontrada. Usando apenas banco local.")
-    return None
-
-
-LOCAL_DB_PATH = "banco_chamados.db"
-
-
-def is_cloud() -> bool:
-    return get_connection_string() is not None
-
-
-def get_local_connection():
-    import sqlite3
-    return sqlite3.connect(LOCAL_DB_PATH, check_same_thread=False)
-
-
-def get_cloud_connection():
-    cloud_url = get_connection_string()
-    if not cloud_url:
-        return None
-    try:
-        import sqlitecloud
-        conn = sqlitecloud.connect(cloud_url)
-        return conn
-    except ImportError as e:
-        log_error("Pacote sqlitecloud não instalado. Rode: pip install sqlitecloud", e)
-        return None
-    except Exception as e:
-        log_error(f"Falha ao conectar no SQLite Cloud | url={cloud_url[:60]}...", e)
-        return None
-
-
-def get_db_connection():
-    """
-    Conexão principal de leitura/escrita.
-    Prioridade: Cloud (se configurado) → Local.
-    """
-    cloud = get_cloud_connection()
-    if cloud is not None:
-        return cloud
-    return get_local_connection()
-
-
-def _ensure_schema(conn):
-    """Cria tabelas se não existirem em uma conexão qualquer."""
-    cur = conn.cursor()
-    cur.execute("""
-        CREATE TABLE IF NOT EXISTS chamados (
-            id INTEGER PRIMARY KEY,
-            solicitante TEXT,
-            data_hora_abertura TEXT,
-            setor TEXT,
-            equipamento TEXT,
-            prioridade TEXT,
-            descricao TEXT,
-            status TEXT,
-            executante TEXT,
-            data_hora_inicio TEXT,
-            data_hora_conclusao TEXT,
-            foto_path TEXT,
-            solucao_descricao TEXT,
-            foto_solucao_path TEXT
-        )
-    """)
-    cur.execute("""
-        CREATE TABLE IF NOT EXISTS equipe (
-            id INTEGER PRIMARY KEY,
-            nome TEXT,
-            funcao TEXT,
-            contato TEXT,
-            ativo INTEGER DEFAULT 1
-        )
-    """)
-    cur.execute("""
-        CREATE TABLE IF NOT EXISTS setores (
-            id INTEGER PRIMARY KEY,
-            setor TEXT UNIQUE
-        )
-    """)
-    cur.execute("""
-        CREATE TABLE IF NOT EXISTS equipamentos (
-            id INTEGER PRIMARY KEY,
-            nome TEXT,
-            marca TEXT,
-            modelo TEXT,
-            ano_aquisicao INTEGER,
-            numero_patrimonio TEXT,
-            setor TEXT,
-            sazonalidade_meses INTEGER,
-            ultima_preventiva TEXT,
-            proxima_preventiva TEXT
-        )
-    """)
-    conn.commit()
-
-
-def sync_local_to_cloud() -> tuple[bool, str]:
-    """
-    Copia TODAS as tabelas do banco local → SQLite Cloud.
-    Útil para popular o cloud com dados que já existem no PC.
-
-    Não usa df.to_sql(..., if_exists="append"): o driver sqlitecloud faz o
-    pandas tentar CREATE TABLE mesmo com append, gerando
-    "table already exists". Fluxo: schema garantido + DELETE + INSERT.
-    """
-    if not is_cloud():
-        return False, "SQLITECLOUD_URL não configurada nos Secrets."
-
-    try:
-        import sqlite3
-        local = sqlite3.connect(LOCAL_DB_PATH, check_same_thread=False)
-        _ensure_schema(local)
-
-        cloud = get_cloud_connection()
-        if cloud is None:
-            local.close()
-            return False, "Não foi possível conectar no SQLite Cloud."
-        _ensure_schema(cloud)
-
-        tabelas = ["chamados", "equipe", "setores", "equipamentos"]
-        resumo = []
-
-        def _safe_cell(v):
-            """Normaliza célula para INSERT (None / string de data)."""
-            if v is None:
-                return None
-            try:
-                if pd.isna(v):
-                    return None
-            except (TypeError, ValueError):
-                pass
-            if hasattr(v, "strftime"):
-                try:
-                    return v.strftime("%Y-%m-%d %H:%M:%S")
-                except (ValueError, TypeError, OverflowError):
-                    return None
-            return v
-
-        for tabela in tabelas:
-            df = pd.read_sql(f"SELECT * FROM {tabela}", local)
-            cloud_cur = cloud.cursor()
-            # Limpa a tabela no cloud (schema já existe via _ensure_schema)
-            cloud_cur.execute(f"DELETE FROM {tabela}")
-            cloud.commit()
-
-            if not df.empty:
-                df = df.where(pd.notnull(df), None)
-                for col in df.columns:
-                    if (
-                        "data" in col.lower()
-                        or "hora" in col.lower()
-                        or "preventiva" in col.lower()
-                    ):
-                        df[col] = df[col].apply(_safe_cell)
-
-                cols = list(df.columns)
-                placeholders = ",".join(["?"] * len(cols))
-                col_names = ",".join(cols)
-                sql = f"INSERT INTO {tabela} ({col_names}) VALUES ({placeholders})"
-                rows = [
-                    tuple(_safe_cell(v) for v in row)
-                    for row in df.itertuples(index=False, name=None)
-                ]
-                cloud_cur.executemany(sql, rows)
-                cloud.commit()
-
-            resumo.append(f"{tabela}: {len(df)} registros")
-
-        local.close()
-        cloud.close()
-        msg = "Sincronização Local → Cloud OK | " + " | ".join(resumo)
-        logger.info(msg)
-        return True, msg
-    except Exception as e:
-        log_error("sync_local_to_cloud falhou", e)
-        return False, f"Erro na sincronização: {e}"
-
-
-def dual_write_execute(sql: str, params: tuple = ()):
-    """
-    Executa o mesmo SQL no local E no cloud (se configurado).
-    Garante que os dois bancos fiquem alinhados.
-    """
-    erros = []
-
-    # 1) Local (sempre)
-    try:
-        local = get_local_connection()
-        _ensure_schema(local)
-        local.execute(sql, params)
-        local.commit()
-        local.close()
-    except Exception as e:
-        log_error(f"dual_write LOCAL falhou: {sql[:80]}", e)
-        erros.append(f"local: {e}")
-
-    # 2) Cloud (se houver)
-    if is_cloud():
-        try:
-            cloud = get_cloud_connection()
-            if cloud is not None:
-                _ensure_schema(cloud)
-                cloud.execute(sql, params)
-                cloud.commit()
-                cloud.close()
-        except Exception as e:
-            log_error(f"dual_write CLOUD falhou: {sql[:80]}", e)
-            erros.append(f"cloud: {e}")
-
-    return len(erros) == 0, erros
-
-
-# ====================== BANCO DE DADOS ======================
-def init_db():
-    """Cria tabelas no local e no cloud (se configurado)."""
-    cloud_ok = False
-    cloud_msg = "não configurado"
-    try:
-        # Local sempre
-        local = get_local_connection()
-        _ensure_schema(local)
-        local.close()
-
-        url = get_connection_string()
-        if url:
-            cloud = get_cloud_connection()
-            if cloud is not None:
-                try:
-                    _ensure_schema(cloud)
-                    # Teste simples de leitura
-                    cur = cloud.cursor()
-                    cur.execute("SELECT COUNT(*) FROM chamados")
-                    cur.fetchone()
-                    cloud.close()
-                    cloud_ok = True
-                    cloud_msg = "conectado OK"
-                except Exception as e:
-                    cloud_msg = f"conectado mas schema/query falhou: {e}"
-                    log_error("init_db cloud schema/query", e)
-                    try:
-                        cloud.close()
-                    except Exception:
-                        pass
-            else:
-                cloud_msg = "URL encontrada mas conexão falhou (veja log)"
-        else:
-            cloud_msg = "SQLITECLOUD_URL ausente nos secrets"
-
-        modo = "local+cloud" if cloud_ok else "local"
-        logger.info("init_db OK | modo=%s | cloud=%s", modo, cloud_msg)
-
-        # Guarda status para a UI
-        if "db_status" not in st.session_state:
-            st.session_state.db_status = {
-                "modo": modo,
-                "cloud_ok": cloud_ok,
-                "cloud_msg": cloud_msg,
-            }
-        else:
-            st.session_state.db_status = {
-                "modo": modo,
-                "cloud_ok": cloud_ok,
-                "cloud_msg": cloud_msg,
-            }
-    except Exception as e:
-        log_error("init_db falhou", e)
-        st.error(f"Erro ao inicializar banco: {e}")
-
-
-def _normalize_datetime_cols(df: pd.DataFrame) -> pd.DataFrame:
-    for col in ["data_hora_abertura", "data_hora_inicio", "data_hora_conclusao"]:
-        if col in df.columns:
-            df[col] = pd.to_datetime(df[col], errors="coerce")
-    return df
-
-
-def carregar_dados() -> list[dict]:
-    try:
-        conn = get_db_connection()
-        df = pd.read_sql("SELECT * FROM chamados", conn)
-        conn.close()
-        if df.empty:
-            return []
-        df = _normalize_datetime_cols(df)
-        # Converte NaT / NaN para None para serialização limpa
-        records = df.where(pd.notnull(df), None).to_dict(orient="records")
-        return records
-    except Exception as e:
-        log_error("carregar_dados falhou", e)
-        st.error(f"Erro ao carregar chamados: {e}")
-        return []
-
-
-def _fmt_data(v):
-    """Normaliza datas para string ISO (trata None, NaN, NaT)."""
-    if v is None or v == "":
-        return None
-    try:
-        if pd.isna(v):
-            return None
-    except (TypeError, ValueError):
-        pass
-    if isinstance(v, datetime):
-        try:
-            return v.strftime("%Y-%m-%d %H:%M:%S")
-        except (ValueError, TypeError, OverflowError):
-            return None
-    try:
-        ts = pd.to_datetime(v, errors="coerce")
-        if pd.isna(ts):
-            return None
-        return ts.strftime("%Y-%m-%d %H:%M:%S")
-    except Exception:
-        pass
-    s = str(v).strip()
-    return s if s and s.lower() not in ("nat", "nan", "none") else None
-
-
-def _upsert_chamado_em(conn, campos: dict) -> None:
-    """Executa INSERT ou UPDATE de um chamado em uma conexão."""
-    cur = conn.cursor()
-    cur.execute("SELECT 1 FROM chamados WHERE id = ?", (campos["id"],))
-    existe = cur.fetchone() is not None
-
-    if existe:
-        cur.execute("""
-            UPDATE chamados SET
-                solicitante=?, data_hora_abertura=?, setor=?, equipamento=?,
-                prioridade=?, descricao=?, status=?, executante=?,
-                data_hora_inicio=?, data_hora_conclusao=?, foto_path=?,
-                solucao_descricao=?, foto_solucao_path=?
-            WHERE id=?
-        """, (
-            campos["solicitante"], campos["data_hora_abertura"], campos["setor"],
-            campos["equipamento"], campos["prioridade"], campos["descricao"],
-            campos["status"], campos["executante"], campos["data_hora_inicio"],
-            campos["data_hora_conclusao"], campos["foto_path"],
-            campos["solucao_descricao"], campos["foto_solucao_path"],
-            campos["id"],
-        ))
-    else:
-        cur.execute("""
-            INSERT INTO chamados (
-                id, solicitante, data_hora_abertura, setor, equipamento,
-                prioridade, descricao, status, executante,
-                data_hora_inicio, data_hora_conclusao, foto_path,
-                solucao_descricao, foto_solucao_path
-            ) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?)
-        """, (
-            campos["id"], campos["solicitante"], campos["data_hora_abertura"],
-            campos["setor"], campos["equipamento"], campos["prioridade"],
-            campos["descricao"], campos["status"], campos["executante"],
-            campos["data_hora_inicio"], campos["data_hora_conclusao"],
-            campos["foto_path"], campos["solucao_descricao"],
-            campos["foto_solucao_path"],
-        ))
-    conn.commit()
-
-
-def salvar_chamado(chamado: dict) -> bool:
-    """
-    Upsert de um chamado no LOCAL e no CLOUD (dual-write).
-    """
-    try:
-        campos = {
-            "id": chamado.get("id"),
-            "solicitante": chamado.get("solicitante"),
-            "data_hora_abertura": _fmt_data(chamado.get("data_hora_abertura")),
-            "setor": chamado.get("setor"),
-            "equipamento": chamado.get("equipamento"),
-            "prioridade": chamado.get("prioridade"),
-            "descricao": chamado.get("descricao"),
-            "status": chamado.get("status"),
-            "executante": chamado.get("executante") or "",
-            "data_hora_inicio": _fmt_data(chamado.get("data_hora_inicio")),
-            "data_hora_conclusao": _fmt_data(chamado.get("data_hora_conclusao")),
-            "foto_path": chamado.get("foto_path"),
-            "solucao_descricao": chamado.get("solucao_descricao") or "",
-            "foto_solucao_path": chamado.get("foto_solucao_path"),
-        }
-
-        # 1) Local (sempre)
-        local = get_local_connection()
-        _ensure_schema(local)
-        _upsert_chamado_em(local, campos)
-        local.close()
-
-        # 2) Cloud (se configurado)
-        if is_cloud():
-            cloud = get_cloud_connection()
-            if cloud is not None:
-                _ensure_schema(cloud)
-                _upsert_chamado_em(cloud, campos)
-                cloud.close()
-
-        logger.info(
-            "salvar_chamado OK | id=%s status=%s | dual=%s",
-            campos["id"], campos["status"], is_cloud(),
-        )
-        return True
-    except Exception as e:
-        log_error(f"salvar_chamado id={chamado.get('id')} falhou", e)
-        st.error(f"Erro ao salvar chamado: {e}")
-        return False
-
-
-def salvar_dados(chamados_list: list[dict]) -> bool:
-    """
-    Salva lista completa de forma segura (um a um com upsert).
-    Mantém compatibilidade com o código legado que passa a lista inteira.
-    """
-    ok = True
-    for c in chamados_list:
-        if not salvar_chamado(c):
-            ok = False
-    return ok
-
-
-def proximo_id_chamado() -> int:
-    """Pega o maior ID entre local e cloud para evitar conflito."""
-    ids = []
-    try:
-        local = get_local_connection()
-        cur = local.cursor()
-        cur.execute("SELECT COALESCE(MAX(id), 0) FROM chamados")
-        ids.append(int(cur.fetchone()[0]))
-        local.close()
-    except Exception as e:
-        log_error("proximo_id local falhou", e)
-    if is_cloud():
-        try:
-            cloud = get_cloud_connection()
-            if cloud is not None:
-                cur = cloud.cursor()
-                cur.execute("SELECT COALESCE(MAX(id), 0) FROM chamados")
-                ids.append(int(cur.fetchone()[0]))
-                cloud.close()
-        except Exception as e:
-            log_error("proximo_id cloud falhou", e)
-    return (max(ids) + 1) if ids else 1
-
-
-def carregar_equipe() -> pd.DataFrame:
-    try:
-        conn = get_db_connection()
-        df = pd.read_sql("SELECT * FROM equipe", conn)
-        conn.close()
-        return df
-    except Exception as e:
-        log_error("carregar_equipe falhou", e)
-        return pd.DataFrame(columns=["id", "nome", "funcao", "contato", "ativo"])
-
-
-def _write_equipe_em(conn, df: pd.DataFrame):
-    cur = conn.cursor()
-    cur.execute("DELETE FROM equipe")
-    for _, row in df.iterrows():
-        cur.execute(
-            "INSERT INTO equipe (id, nome, funcao, contato, ativo) VALUES (?,?,?,?,?)",
-            (
-                int(row["id"]) if pd.notnull(row.get("id")) else None,
-                row.get("nome"),
-                row.get("funcao"),
-                row.get("contato"),
-                int(row.get("ativo", 1)),
-            ),
-        )
-    conn.commit()
-
-
-def salvar_equipe(df: pd.DataFrame) -> bool:
-    """Salva equipe no local e no cloud."""
-    try:
-        local = get_local_connection()
-        _ensure_schema(local)
-        _write_equipe_em(local, df)
-        local.close()
-        if is_cloud():
-            cloud = get_cloud_connection()
-            if cloud is not None:
-                _ensure_schema(cloud)
-                _write_equipe_em(cloud, df)
-                cloud.close()
-        logger.info("salvar_equipe OK | %d registros | dual=%s", len(df), is_cloud())
-        return True
-    except Exception as e:
-        log_error("salvar_equipe falhou", e)
-        st.error(f"Erro ao salvar equipe: {e}")
-        return False
-
-
-def adicionar_membro_equipe(nome: str, funcao: str, contato: str) -> bool:
-    try:
-        # ID a partir do local
-        local = get_local_connection()
-        _ensure_schema(local)
-        cur = local.cursor()
-        cur.execute("SELECT COALESCE(MAX(id), 0) + 1 FROM equipe")
-        novo_id = cur.fetchone()[0]
-        local.close()
-
-        sql = "INSERT INTO equipe (id, nome, funcao, contato, ativo) VALUES (?,?,?,?,1)"
-        params = (novo_id, nome, funcao, contato)
-
-        local = get_local_connection()
-        local.execute(sql, params)
-        local.commit()
-        local.close()
-
-        if is_cloud():
-            cloud = get_cloud_connection()
-            if cloud is not None:
-                _ensure_schema(cloud)
-                cloud.execute(sql, params)
-                cloud.commit()
-                cloud.close()
-
-        logger.info("adicionar_membro_equipe OK | %s", nome)
-        return True
-    except Exception as e:
-        log_error("adicionar_membro_equipe falhou", e)
-        st.error(f"Erro ao cadastrar membro: {e}")
-        return False
-
-
-def excluir_membro_equipe(membro_id: int) -> bool:
-    try:
-        sql = "DELETE FROM equipe WHERE id = ?"
-        params = (membro_id,)
-        local = get_local_connection()
-        local.execute(sql, params)
-        local.commit()
-        local.close()
-        if is_cloud():
-            cloud = get_cloud_connection()
-            if cloud is not None:
-                cloud.execute(sql, params)
-                cloud.commit()
-                cloud.close()
-        return True
-    except Exception as e:
-        log_error("excluir_membro_equipe falhou", e)
-        return False
-
-
-def carregar_setores() -> list[str]:
-    default_setores = [
-        "Fracionamento 1", "Fracionamento 2", "Mistura 1", "Mistura 2",
-        "Mistura 3", "Mistura 4", "Envase 1", "Envase 2", "RH 1",
-        "Laboratório", "Outros",
-    ]
-    try:
-        conn = get_db_connection()
-        df = pd.read_sql("SELECT setor FROM setores ORDER BY setor", conn)
-        conn.close()
-        if df.empty:
-            # popula defaults na primeira execução
-            salvar_setores(default_setores)
-            return default_setores
-        return df["setor"].dropna().tolist()
-    except Exception as e:
-        log_error("carregar_setores falhou", e)
-        return default_setores
-
-
-def _write_setores_em(conn, lista: list[str]):
-    cur = conn.cursor()
-    cur.execute("DELETE FROM setores")
-    for i, s in enumerate(lista, start=1):
-        if s and str(s).strip():
-            cur.execute(
-                "INSERT INTO setores (id, setor) VALUES (?,?)",
-                (i, str(s).strip()),
-            )
-    conn.commit()
-
-
-def salvar_setores(lista: list[str]) -> bool:
-    try:
-        local = get_local_connection()
-        _ensure_schema(local)
-        _write_setores_em(local, lista)
-        local.close()
-        if is_cloud():
-            cloud = get_cloud_connection()
-            if cloud is not None:
-                _ensure_schema(cloud)
-                _write_setores_em(cloud, lista)
-                cloud.close()
-        logger.info("salvar_setores OK | %d itens | dual=%s", len(lista), is_cloud())
-        return True
-    except Exception as e:
-        log_error("salvar_setores falhou", e)
-        st.error(f"Erro ao salvar setores: {e}")
-        return False
-
-
-def carregar_equipamentos() -> list[dict]:
-    try:
-        conn = get_db_connection()
-        df = pd.read_sql("SELECT * FROM equipamentos", conn)
-        conn.close()
-        if df.empty:
-            return []
-        return df.where(pd.notnull(df), None).to_dict(orient="records")
-    except Exception as e:
-        log_error("carregar_equipamentos falhou", e)
-        return []
-
-
-def _upsert_equipamento_em(conn, eq: dict):
-    cur = conn.cursor()
-    eq_id = eq.get("id")
-    cur.execute("SELECT 1 FROM equipamentos WHERE id = ?", (eq_id,))
-    existe = cur.fetchone() is not None
-    vals = (
-        eq.get("nome"),
-        eq.get("marca"),
-        eq.get("modelo"),
-        eq.get("ano_aquisicao"),
-        eq.get("numero_patrimonio"),
-        eq.get("setor"),
-        eq.get("sazonalidade_meses"),
-        eq.get("ultima_preventiva"),
-        eq.get("proxima_preventiva"),
-    )
-    if existe:
-        cur.execute("""
-            UPDATE equipamentos SET
-                nome=?, marca=?, modelo=?, ano_aquisicao=?,
-                numero_patrimonio=?, setor=?, sazonalidade_meses=?,
-                ultima_preventiva=?, proxima_preventiva=?
-            WHERE id=?
-        """, (*vals, eq_id))
-    else:
-        cur.execute("""
-            INSERT INTO equipamentos (
-                id, nome, marca, modelo, ano_aquisicao, numero_patrimonio,
-                setor, sazonalidade_meses, ultima_preventiva, proxima_preventiva
-            ) VALUES (?,?,?,?,?,?,?,?,?,?)
-        """, (eq_id, *vals))
-    conn.commit()
-
-
-def salvar_equipamento(eq: dict) -> bool:
-    """Upsert de equipamento no local e no cloud."""
-    try:
-        local = get_local_connection()
-        _ensure_schema(local)
-        _upsert_equipamento_em(local, eq)
-        local.close()
-        if is_cloud():
-            cloud = get_cloud_connection()
-            if cloud is not None:
-                _ensure_schema(cloud)
-                _upsert_equipamento_em(cloud, eq)
-                cloud.close()
-        logger.info("salvar_equipamento OK | id=%s | dual=%s", eq.get("id"), is_cloud())
-        return True
-    except Exception as e:
-        log_error("salvar_equipamento falhou", e)
-        st.error(f"Erro ao salvar equipamento: {e}")
-        return False
-
-
-def excluir_equipamento(eq_id: int) -> bool:
-    try:
-        sql = "DELETE FROM equipamentos WHERE id = ?"
-        params = (eq_id,)
-        local = get_local_connection()
-        local.execute(sql, params)
-        local.commit()
-        local.close()
-        if is_cloud():
-            cloud = get_cloud_connection()
-            if cloud is not None:
-                cloud.execute(sql, params)
-                cloud.commit()
-                cloud.close()
-        return True
-    except Exception as e:
-        log_error("excluir_equipamento falhou", e)
-        return False
-
-
-def proximo_id_equipamento() -> int:
-    ids = []
-    try:
-        local = get_local_connection()
-        cur = local.cursor()
-        cur.execute("SELECT COALESCE(MAX(id), 0) FROM equipamentos")
-        ids.append(int(cur.fetchone()[0]))
-        local.close()
-    except Exception:
-        pass
-    if is_cloud():
-        try:
-            cloud = get_cloud_connection()
-            if cloud is not None:
-                cur = cloud.cursor()
-                cur.execute("SELECT COALESCE(MAX(id), 0) FROM equipamentos")
-                ids.append(int(cur.fetchone()[0]))
-                cloud.close()
-        except Exception:
-            pass
-    return (max(ids) + 1) if ids else 1
-
-
-def nome_equipamento(eq: dict) -> str:
-    return eq.get("nome") or eq.get("Equipamento") or "N/A"
-
-
-def parse_datetime_safe(value, default: datetime | None = None) -> datetime:
-    """
-    Converte string / Timestamp / NaN / None em datetime de forma segura.
-    Evita ValueError: cannot convert float NaN to integer.
-    """
-    if default is None:
-        default = datetime.now()
-    if value is None:
-        return default
-    try:
-        if pd.isna(value):
-            return default
-    except (TypeError, ValueError):
-        pass
-    if isinstance(value, datetime):
-        # Garante timezone-naive para cálculos simples
-        if getattr(value, "tzinfo", None) is not None:
-            try:
-                return value.replace(tzinfo=None)
-            except Exception:
-                return default
-        return value
-    if isinstance(value, str):
-        s = value.strip().replace("Z", "+00:00")
-        try:
-            dt = datetime.fromisoformat(s)
-            if dt.tzinfo is not None:
-                dt = dt.replace(tzinfo=None)
-            return dt
-        except Exception:
-            pass
-    try:
-        ts = pd.to_datetime(value, errors="coerce")
-        if pd.isna(ts):
-            return default
-        dt = ts.to_pydatetime()
-        if getattr(dt, "tzinfo", None) is not None:
-            dt = dt.replace(tzinfo=None)
-        return dt
-    except Exception:
-        return default
-
-
-def comprimir_imagem(image_bytes, prefixo="chamado", max_size=900, quality=82):
-    try:
-        img = Image.open(image_bytes)
-        img = ImageOps.exif_transpose(img)
-        if max(img.size) > max_size:
-            ratio = max_size / max(img.size)
-            new_size = tuple(int(dim * ratio) for dim in img.size)
-            img = img.resize(new_size, Image.Resampling.LANCZOS)
-        output_path = f"fotos_chamados/{prefixo}_{datetime.now().strftime('%Y%m%d_%H%M%S_%f')}.jpg"
-        img.save(output_path, "JPEG", quality=quality, optimize=True)
-        return output_path
-    except Exception as e:
-        log_error("comprimir_imagem falhou", e)
-        st.error(f"Erro ao comprimir imagem: {e}")
-        return None
-
-
-def reload_data():
-    st.session_state.chamados = carregar_dados()
-    st.session_state.equipe = carregar_equipe()
-    st.session_state.setores = carregar_setores()
-    st.session_state.equipamentos = carregar_equipamentos()
-
-
-# ====================== AUTH ADMIN (via secrets) ======================
-def verificar_login_admin(usuario: str, senha: str) -> bool:
-    """
-    Usa secrets.toml:
-      [admin]
-      username = "Leandro Coelho"
-      password_hash = "sha256..."
-    Fallback: usuário/senha legados se secrets não existirem.
-    """
-    try:
-        admin = st.secrets.get("admin", {})
-        expected_user = admin.get("username", "Leandro Coelho")
-        expected_hash = admin.get("password_hash")
-        if expected_hash:
-            dig = hashlib.sha256(senha.encode("utf-8")).hexdigest()
-            return usuario.strip() == expected_user and dig == expected_hash
-    except Exception:
-        pass
-    # Fallback legado
-    return usuario.strip() == "Leandro Coelho" and senha == "123"
-
 
 # ====================== INICIALIZAÇÃO ======================
 init_db()
@@ -947,12 +120,44 @@ if "ultimo_alarme" not in st.session_state:
 PRIORIDADES = {"Crítica": 1, "Alta": 2, "Média": 3, "Baixa": 4}
 SLA_TEMPO = {"Crítica": 20, "Alta": 60, "Média": 240, "Baixa": 1440}
 
+
+def _safe_int(v, default: int = 0) -> int:
+    """Converte valor para int tolerando None/NaN."""
+    try:
+        if v is None:
+            return default
+        try:
+            if pd.isna(v):
+                return default
+        except (TypeError, ValueError):
+            pass
+        return int(float(v))
+    except (TypeError, ValueError, OverflowError):
+        return default
+
+
+def _safe_float(v, default: float = 0.0) -> float:
+    """Converte valor para float tolerando None/NaN."""
+    try:
+        if v is None:
+            return default
+        try:
+            if pd.isna(v):
+                return default
+        except (TypeError, ValueError):
+            pass
+        return float(v)
+    except (TypeError, ValueError, OverflowError):
+        return default
+
+
 # ====================== CABEÇALHO ======================
 header(
     "Gestão de Chamados e Manutenção",
     "Fluxo integrado de solicitações, execução e indicadores",
     icon="🏭",
 )
+_mostrar_efeito_pendente()
 
 # Indicador de modo de banco
 status = st.session_state.get("db_status", {})
@@ -966,7 +171,12 @@ else:
 st.sidebar.header("🔑 Controle de Acesso")
 perfil = st.sidebar.selectbox(
     "Escolha seu Perfil:",
-    ["👤 Usuário Comum", "🛠️ Equipe de Manutenção", "👨‍💼 Administrador"],
+    [
+        "👤 Usuário Comum",
+        "🛠️ Equipe de Manutenção",
+        "🛒 Compras",
+        "👨‍💼 Administrador",
+    ],
 )
 
 # ====================== USUÁRIO COMUM ======================
@@ -1027,12 +237,17 @@ if perfil == "👤 Usuário Comum":
                         "foto_path": foto_path,
                         "solucao_descricao": "",
                         "foto_solucao_path": None,
+                        "comentario_conclusao": "",
+                        "peca_solicitada": "",
+                        "peca_observacao": "",
+                        "data_solicitacao_peca": None,
                     }
                     if salvar_chamado(novo):
                         st.session_state.chamados.append(novo)
-                        st.success(f"✅ Chamado Nº **{novo_id}** registrado com sucesso!")
-                        st.balloons()
-                        reload_data()
+                        agendar_efeito_concluido(
+                            f"✅ Chamado Nº {novo_id} aberto com sucesso!",
+                            celebrar=True,
+                        )
                         st.rerun()
                 else:
                     st.error("❌ Preencha os campos obrigatórios.")
@@ -1085,7 +300,12 @@ if perfil == "👤 Usuário Comum":
 
 # ====================== EQUIPE DE MANUTENÇÃO ======================
 elif perfil == "🛠️ Equipe de Manutenção":
-    header("Fila de Manutenção", "Chamados priorizados e alertas preventivos", icon="🛠️")
+    header(
+        "Fila de Manutenção",
+        "Chamados priorizados e alertas preventivos",
+        icon="🛠️",
+        nivel="secao",
+    )
     reload_data()
 
     col_f1, col_f2, col_f3 = st.columns([3, 2, 2])
@@ -1099,8 +319,8 @@ elif perfil == "🛠️ Equipe de Manutenção":
     with col_f2:
         filtro_status = st.multiselect(
             "Status",
-            ["Aberto", "Em Atendimento"],
-            default=["Aberto", "Em Atendimento"],
+            ["Aberto", "Em Atendimento", "Aguardando Peça"],
+            default=["Aberto", "Em Atendimento", "Aguardando Peça"],
             key="filtro_status_main",
         )
     with col_f3:
@@ -1130,24 +350,207 @@ elif perfil == "🛠️ Equipe de Manutenção":
                 )
             st.session_state.ultimo_alarme = agora
 
-    # Alertas Preventivos
-    with st.container(border=True):
-        st.subheader("⚠️ Alertas de Manutenção Preventiva")
-        hoje = datetime.now().date()
-        alertas = 0
-        for eq in st.session_state.equipamentos:
-            if eq.get("proxima_preventiva"):
+    # ====================== ALERTAS PREVENTIVOS (compacto · tema + ações) ======================
+    hoje = datetime.now().date()
+    alertas_lista = []
+    nomes_tecnicos_ativos = [
+        row["nome"]
+        for _, row in st.session_state.equipe.iterrows()
+        if row.get("ativo") == 1
+    ]
+
+    for eq in st.session_state.equipamentos:
+        if not eq.get("proxima_preventiva"):
+            continue
+        try:
+            # Respeita silenciar_ate (adiar alerta)
+            sil = eq.get("silenciar_ate")
+            if sil:
                 try:
-                    prox = datetime.fromisoformat(str(eq["proxima_preventiva"])).date()
-                    if prox <= hoje + timedelta(days=30):
-                        st.warning(
-                            f"**{nome_equipamento(eq)}** — Preventiva próxima ({prox.strftime('%d/%m/%Y')})"
-                        )
-                        alertas += 1
+                    sil_dt = datetime.fromisoformat(str(sil)).date()
+                    if sil_dt > hoje:
+                        continue
                 except Exception:
                     pass
-        if alertas == 0:
+            prox = datetime.fromisoformat(str(eq["proxima_preventiva"])).date()
+            if prox <= hoje + timedelta(days=30):
+                dias = (prox - hoje).days
+                alertas_lista.append({
+                    "eq": eq,
+                    "id": eq.get("id"),
+                    "nome": nome_equipamento(eq),
+                    "setor": eq.get("setor") or "—",
+                    "data": prox.strftime("%d/%m/%Y"),
+                    "dias": dias,
+                })
+        except Exception:
+            continue
+
+    with st.container(border=True):
+        if not alertas_lista:
             st.success("✅ Nenhum alerta preventivo nos próximos 30 dias.")
+        else:
+            alertas_lista.sort(key=lambda x: x["dias"])
+            vencidos = sum(1 for a in alertas_lista if a["dias"] < 0)
+            urgentes = sum(1 for a in alertas_lista if 0 <= a["dias"] <= 7)
+            normais = len(alertas_lista) - vencidos - urgentes
+
+            partes = [f"{len(alertas_lista)} alerta(s)"]
+            if vencidos:
+                partes.append(f"🔴 {vencidos} vencido(s)")
+            if urgentes:
+                partes.append(f"🟠 {urgentes} ≤ 7 dias")
+            if normais:
+                partes.append(f"🟡 {normais} em até 30 dias")
+
+            # Expander principal sempre fechado; só prioritários visíveis ao abrir
+            prioritarios = [a for a in alertas_lista if a["dias"] <= 7]
+            demais = [a for a in alertas_lista if a["dias"] > 7]
+
+            def _render_alerta_prev(a, idx, prefix):
+                eq_id = a["id"]
+                uk = f"{prefix}_{eq_id}_{idx}"
+                if a["dias"] < 0:
+                    badge_txt, badge_bg, badge_fg, border = (
+                        "🔴 VENCIDO", "#7f1d1d", "#fecaca", "#ef4444",
+                    )
+                    prazo = f"há {abs(a['dias'])} dia(s)"
+                elif a["dias"] == 0:
+                    badge_txt, badge_bg, badge_fg, border = (
+                        "🔴 HOJE", "#7f1d1d", "#fecaca", "#ef4444",
+                    )
+                    prazo = "hoje"
+                elif a["dias"] <= 7:
+                    badge_txt, badge_bg, badge_fg, border = (
+                        "🟠 URGENTE", "#78350f", "#fde047", "#fbbf24",
+                    )
+                    prazo = f"em {a['dias']} dia(s)"
+                else:
+                    badge_txt, badge_bg, badge_fg, border = (
+                        "🟡 EM BREVE", "#3f3f46", "#facc15", "#a3a3a3",
+                    )
+                    prazo = f"em {a['dias']} dia(s)"
+
+                st.markdown(
+                    f"""
+                    <div style="
+                        display:flex; align-items:center; justify-content:space-between;
+                        gap:12px; padding:10px 14px; margin:6px 0 2px 0;
+                        border-radius:12px; border:1px solid #333;
+                        border-left:4px solid {border};
+                        background:#111111;
+                    ">
+                        <div style="flex:1; min-width:0;">
+                            <div style="font-weight:700; color:#f1f1f1; font-size:0.95rem;
+                                        white-space:nowrap; overflow:hidden; text-overflow:ellipsis;">
+                                {a['nome']}
+                            </div>
+                            <div style="font-size:0.82rem; color:#a3a3a3; margin-top:2px;">
+                                {a['setor']} · {a['data']} · {prazo}
+                            </div>
+                        </div>
+                        <span class="badge" style="
+                            flex-shrink:0; background:{badge_bg}; color:{badge_fg};
+                            border:1px solid {border}; padding:5px 12px;
+                            border-radius:9999px; font-weight:700; font-size:0.75rem;
+                        ">{badge_txt}</span>
+                    </div>
+                    """,
+                    unsafe_allow_html=True,
+                )
+
+                with st.popover(
+                    "⚙️ Registrar / Adiar",
+                    key=f"pop_prev_{uk}",
+                    use_container_width=True,
+                ):
+                    st.caption(f"**{a['nome']}**")
+                    tec = st.selectbox(
+                        "Executante",
+                        [""] + nomes_tecnicos_ativos,
+                        key=f"prev_tec_{uk}",
+                    )
+                    desc = st.text_area(
+                        "Descrição / serviços realizados",
+                        key=f"prev_desc_{uk}",
+                        height=70,
+                    )
+                    pecas = st.text_input(
+                        "Peças trocadas",
+                        key=f"prev_pecas_{uk}",
+                        placeholder="Ex.: rolamento 6205, correia A",
+                    )
+                    c1, c2 = st.columns(2)
+                    with c1:
+                        custo = st.number_input(
+                            "Custo peças (R$)",
+                            min_value=0.0,
+                            step=10.0,
+                            key=f"prev_custo_{uk}",
+                        )
+                    with c2:
+                        horas = st.number_input(
+                            "Horas-homem",
+                            min_value=0.0,
+                            step=0.5,
+                            key=f"prev_horas_{uk}",
+                        )
+                    if st.button(
+                        "✅ Concluir preventiva",
+                        key=f"prev_ok_{uk}",
+                        type="primary",
+                        use_container_width=True,
+                    ):
+                        if concluir_preventiva(
+                            a["eq"],
+                            executante=tec or "",
+                            descricao=desc or "",
+                            pecas=pecas or "",
+                            custo_pecas=float(custo or 0),
+                            horas_homem=float(horas or 0),
+                        ):
+                            agendar_efeito_concluido(
+                                "✅ Preventiva concluída e próxima data recalculada!",
+                                celebrar=True,
+                            )
+                            reload_data()
+                            st.rerun()
+
+                    st.divider()
+                    dias_adiar = st.selectbox(
+                        "Adiar alerta por",
+                        [7, 14, 30],
+                        format_func=lambda d: f"{d} dias",
+                        key=f"prev_adiar_d_{uk}",
+                    )
+                    if st.button(
+                        "🔕 Silenciar alerta",
+                        key=f"prev_adiar_{uk}",
+                        use_container_width=True,
+                    ):
+                        if adiar_alerta_preventiva(a["eq"], dias=int(dias_adiar)):
+                            agendar_efeito_concluido(
+                                f"🔕 Alerta silenciado por {dias_adiar} dias.",
+                                celebrar=False,
+                            )
+                            reload_data()
+                            st.rerun()
+
+            with st.expander(
+                f"⚠️ Manutenção Preventiva — {' · '.join(partes)}",
+                expanded=False,
+            ):
+                if prioritarios:
+                    st.caption("Prioridade (hoje / vencidos / ≤ 7 dias)")
+                    for idx, a in enumerate(prioritarios):
+                        _render_alerta_prev(a, idx, "prio")
+                if demais:
+                    with st.expander(
+                        f"Em breve (8–30 dias) — {len(demais)} item(ns)",
+                        expanded=False,
+                    ):
+                        for idx, a in enumerate(demais):
+                            _render_alerta_prev(a, idx, "demais")
 
     # Filtragem
     ativos = [c for c in st.session_state.chamados if c.get("status") in filtro_status]
@@ -1233,10 +636,117 @@ elif perfil == "🛠️ Equipe de Manutenção":
                             cham["executante"] = nome_tec
                             cham["data_hora_inicio"] = datetime.now().isoformat()
                             if salvar_chamado(cham):
-                                reload_data()
+                                agendar_efeito_concluido(
+                                    f"🚀 OS {cham.get('id')} iniciada por {nome_tec}!",
+                                    celebrar=True,
+                                )
                                 st.rerun()
+
+                elif cham.get("status") == "Aguardando Peça":
+                    st.caption(f"👨‍🔧 Técnico: **{cham.get('executante')}**")
+                    st.warning(
+                        f"🛒 **Aguardando compra/chegada de peça:** {cham.get('peca_solicitada') or 'Não informado'}"
+                    )
+                    if cham.get("peca_observacao"):
+                        st.caption(f"📝 Observação: {cham.get('peca_observacao')}")
+                    # Status da solicitação de compras vinculada
+                    compras_ch = carregar_compras_por_chamado(int(cham.get("id") or 0))
+                    for cp in compras_ch:
+                        st.info(
+                            f"**Compras #{cp.get('id')}** · {cp.get('status')} · "
+                            f"Aprovado: {cp.get('aprovado') or '—'} · "
+                            f"Chegada: {cp.get('dias_para_chegada') or '—'} dia(s) · "
+                            f"Valor: R$ {float(cp.get('valor_item') or 0):,.2f}"
+                        )
+                        if cp.get("link_compra"):
+                            st.caption(f"🔗 {cp.get('link_compra')}")
+                    if st.button(
+                        "📦 Peça Recebida — Retomar Atendimento",
+                        key=f"b_retomar_{cham.get('id')}",
+                        type="primary",
+                        use_container_width=True,
+                    ):
+                        cham["status"] = "Em Atendimento"
+                        for cp in compras_ch:
+                            if cp.get("status") in ("Aprovada", "Comprada", "Pendente"):
+                                cp["status"] = "Recebida"
+                                cp["data_recebimento"] = datetime.now().strftime(
+                                    "%Y-%m-%d %H:%M:%S"
+                                )
+                                salvar_compra(cp)
+                        if salvar_chamado(cham):
+                            agendar_efeito_concluido(
+                                f"📦 Peça recebida — OS {cham.get('id')} retomada!",
+                                celebrar=False,
+                            )
+                            st.rerun()
+
                 else:
                     st.caption(f"👨‍🔧 Técnico: **{cham.get('executante')}**")
+
+                    with st.expander("🛒 Precisa de uma peça para o reparo?"):
+                        peca_nome = st.text_input(
+                            "Peça / Item necessário *", key=f"peca_nome_{cham.get('id')}"
+                        )
+                        peca_link = st.text_input(
+                            "Link (site / Mercado Livre)",
+                            key=f"peca_link_{cham.get('id')}",
+                            placeholder="https://...",
+                        )
+                        peca_prazo = st.date_input(
+                            "Prazo desejado de recebimento",
+                            key=f"peca_prazo_{cham.get('id')}",
+                        )
+                        peca_obs = st.text_area(
+                            "Observação (fornecedor, quantidade, urgência...)",
+                            key=f"peca_obs_{cham.get('id')}",
+                        )
+                        # Histórico de compra anterior do mesmo item
+                        if peca_nome and peca_nome.strip():
+                            hist_c = historico_compras_item(
+                                peca_nome.strip(), cham.get("equipamento")
+                            )
+                            if hist_c:
+                                st.caption("📜 Já comprado anteriormente:")
+                                for h in hist_c[:3]:
+                                    st.caption(
+                                        f"· {h.get('data_solicitacao') or '—'} · "
+                                        f"{h.get('equipamento')} · "
+                                        f"R$ {float(h.get('valor_item') or 0):,.2f} · "
+                                        f"{h.get('status')}"
+                                    )
+                        if st.button(
+                            "🛒 Solicitar Compra de Peça",
+                            key=f"b_peca_{cham.get('id')}",
+                            use_container_width=True,
+                        ):
+                            if peca_nome and peca_nome.strip():
+                                prazo_str = (
+                                    peca_prazo.isoformat()
+                                    if hasattr(peca_prazo, "isoformat")
+                                    else str(peca_prazo)
+                                )
+                                cham["status"] = "Aguardando Peça"
+                                cham["peca_solicitada"] = peca_nome.strip()
+                                cham["peca_observacao"] = peca_obs.strip() if peca_obs else ""
+                                cham["data_solicitacao_peca"] = datetime.now().isoformat()
+                                compra = criar_solicitacao_compra_do_chamado(
+                                    cham,
+                                    item_nome=peca_nome.strip(),
+                                    link_compra=peca_link or "",
+                                    observacao=peca_obs or "",
+                                    prazo_recebimento=prazo_str,
+                                    solicitante=cham.get("executante") or "",
+                                )
+                                if salvar_chamado(cham) and compra:
+                                    agendar_efeito_concluido(
+                                        f"🛒 Solicitação de compra #{compra['id']} enviada ao setor de Compras!",
+                                        celebrar=True,
+                                    )
+                                    st.rerun()
+                            else:
+                                st.error("Informe o nome da peça.")
+
                     opcao_sol = st.radio(
                         "Foto da Solução:",
                         ["Sem foto", "Tirar foto", "Galeria"],
@@ -1260,6 +770,24 @@ elif perfil == "🛠️ Equipe de Manutenção":
                     solucao_txt = st.text_area(
                         "Descreva a solução *", key=f"txt_{cham.get('id')}"
                     )
+                    comentario_txt = st.text_area(
+                        "💬 Comentário adicional (opcional)",
+                        value=cham.get("comentario_conclusao") or "",
+                        key=f"comentario_{cham.get('id')}",
+                        help="Observações extras sobre o atendimento. Pode ser salvo antes de concluir o chamado.",
+                    )
+                    if st.button(
+                        "💾 Salvar Comentário",
+                        key=f"b_salvar_com_{cham.get('id')}",
+                        use_container_width=True,
+                    ):
+                        cham["comentario_conclusao"] = (
+                            comentario_txt.strip() if comentario_txt else ""
+                        )
+                        if salvar_chamado(cham):
+                            agendar_efeito_concluido("💾 Comentário salvo!", celebrar=False)
+                            st.rerun()
+
                     if st.button(
                         "✅ Concluir Chamado",
                         key=f"b_fim_{cham.get('id')}",
@@ -1270,18 +798,189 @@ elif perfil == "🛠️ Equipe de Manutenção":
                             cham["status"] = "Concluído"
                             cham["solucao_descricao"] = solucao_txt.strip()
                             cham["foto_solucao_path"] = foto_sol
+                            cham["comentario_conclusao"] = (
+                                comentario_txt.strip() if comentario_txt else ""
+                            )
                             cham["data_hora_conclusao"] = datetime.now().isoformat()
                             if salvar_chamado(cham):
-                                st.success("✅ Chamado concluído!")
-                                reload_data()
+                                agendar_efeito_concluido(
+                                    f"✅ Chamado Nº {cham.get('id')} concluído!",
+                                    celebrar=True,
+                                )
                                 st.rerun()
                         else:
                             st.error("Descreva a solução.")
 
+# ====================== COMPRAS ======================
+elif perfil == "🛒 Compras":
+    header(
+        "Setor de Compras",
+        "Solicitações de peças · aprovação · recebimento",
+        icon="🛒",
+        nivel="secao",
+    )
+    reload_data()
+    compras = carregar_compras()
+    filtro_cp = st.multiselect(
+        "Status",
+        ["Pendente", "Aprovada", "Rejeitada", "Recebida"],
+        default=["Pendente", "Aprovada"],
+        key="filtro_compras_status",
+    )
+    lista_cp = [c for c in compras if (c.get("status") or "Pendente") in filtro_cp]
+    if not lista_cp:
+        st.success("Nenhuma solicitação com os filtros atuais.")
+    else:
+        st.caption(f"{len(lista_cp)} solicitação(ões)")
+        for cp in lista_cp:
+            cid = cp.get("id")
+            with st.container(border=True):
+                st.markdown(
+                    f"**Compra #{cid}** · OS **{cp.get('chamado_id')}** · "
+                    f"{cp.get('prioridade') or '—'} · **{cp.get('status')}**"
+                )
+                st.write(
+                    f"**Item:** {cp.get('item_nome')}  \n"
+                    f"**Equipamento:** {cp.get('equipamento') or '—'}  \n"
+                    f"**Solicitante:** {cp.get('solicitante') or '—'}  \n"
+                    f"**Prazo recebimento:** {cp.get('prazo_recebimento') or '—'}  \n"
+                    f"**Obs.:** {cp.get('observacao') or '—'}"
+                )
+                if cp.get("link_compra"):
+                    st.markdown(f"🔗 [Abrir link de compra]({cp.get('link_compra')})")
+
+                # Histórico do item
+                hist = historico_compras_item(
+                    cp.get("item_nome") or "", cp.get("equipamento")
+                )
+                hist_outros = [h for h in hist if h.get("id") != cid]
+                if hist_outros:
+                    with st.expander(f"📜 Compras anteriores deste item ({len(hist_outros)})"):
+                        for h in hist_outros[:8]:
+                            st.caption(
+                                f"#{h.get('id')} · {h.get('data_solicitacao')} · "
+                                f"{h.get('equipamento')} · R$ {float(h.get('valor_item') or 0):,.2f} · "
+                                f"{h.get('status')} · aprovado={h.get('aprovado')}"
+                            )
+
+                if cp.get("status") == "Pendente":
+                    with st.popover("⚙️ Analisar / Aprovar", key=f"pop_cp_{cid}"):
+                        aprov = st.radio(
+                            "Compra aprovada?",
+                            ["Sim", "Não"],
+                            horizontal=True,
+                            key=f"cp_aprov_{cid}",
+                        )
+                        dias_ch = st.number_input(
+                            "Dias para chegada (se aprovada)",
+                            min_value=0,
+                            max_value=365,
+                            value=_safe_int(cp.get("dias_para_chegada"), 7),
+                            key=f"cp_dias_{cid}",
+                        )
+                        valor = st.number_input(
+                            "Valor do item (R$)",
+                            min_value=0.0,
+                            step=10.0,
+                            value=_safe_float(cp.get("valor_item"), 0.0),
+                            key=f"cp_valor_{cid}",
+                        )
+                        link_n = st.text_input(
+                            "Link (atualizar se necessário)",
+                            value=cp.get("link_compra") or "",
+                            key=f"cp_link_{cid}",
+                        )
+                        obs_cp = st.text_area(
+                            "Observação do comprador",
+                            value=cp.get("observacao_compras") or "",
+                            key=f"cp_obs_{cid}",
+                        )
+                        comprador = st.text_input(
+                            "Seu nome (comprador)",
+                            key=f"cp_nome_{cid}",
+                        )
+                        if st.button(
+                            "💾 Registrar decisão",
+                            key=f"cp_save_{cid}",
+                            type="primary",
+                        ):
+                            cp["aprovado"] = aprov
+                            cp["link_compra"] = link_n
+                            cp["observacao_compras"] = obs_cp
+                            cp["comprador"] = comprador
+                            cp["data_aprovacao"] = datetime.now().strftime(
+                                "%Y-%m-%d %H:%M:%S"
+                            )
+                            if aprov == "Sim":
+                                cp["status"] = "Aprovada"
+                                cp["dias_para_chegada"] = _safe_int(dias_ch, 0)
+                                cp["valor_item"] = _safe_float(valor, 0.0)
+                                msg = (
+                                    f"Compra APROVADA do item '{cp.get('item_nome')}'. "
+                                    f"Valor R$ {float(valor):,.2f}. "
+                                    f"Previsão de chegada: {int(dias_ch)} dia(s)."
+                                )
+                            else:
+                                cp["status"] = "Rejeitada"
+                                cp["dias_para_chegada"] = None
+                                msg = (
+                                    f"Compra REJEITADA do item '{cp.get('item_nome')}'. "
+                                    f"{obs_cp or ''}"
+                                )
+                            if salvar_compra(cp):
+                                if cp.get("chamado_id"):
+                                    _notificar_chamado_compra(int(cp["chamado_id"]), msg)
+                                agendar_efeito_concluido(msg, celebrar=(aprov == "Sim"))
+                                st.rerun()
+
+                elif cp.get("status") == "Aprovada":
+                    st.success(
+                        f"Aprovada · chegada em {cp.get('dias_para_chegada')} dia(s) · "
+                        f"R$ {float(cp.get('valor_item') or 0):,.2f}"
+                    )
+                    if st.button(
+                        "📦 Marcar como recebida",
+                        key=f"cp_rec_{cid}",
+                        type="primary",
+                    ):
+                        cp["status"] = "Recebida"
+                        cp["data_recebimento"] = datetime.now().strftime(
+                            "%Y-%m-%d %H:%M:%S"
+                        )
+                        if salvar_compra(cp):
+                            msg = (
+                                f"Item '{cp.get('item_nome')}' RECEBIDO. "
+                                f"Valor R$ {float(cp.get('valor_item') or 0):,.2f}."
+                            )
+                            if cp.get("chamado_id"):
+                                _notificar_chamado_compra(int(cp["chamado_id"]), msg)
+                                # retoma OS automaticamente
+                                for c in st.session_state.chamados:
+                                    if c.get("id") == cp.get("chamado_id") and c.get(
+                                        "status"
+                                    ) == "Aguardando Peça":
+                                        c["status"] = "Em Atendimento"
+                                        salvar_chamado(c)
+                                        break
+                            agendar_efeito_concluido(msg, celebrar=True)
+                            st.rerun()
+
+                else:
+                    st.caption(
+                        f"Status final: {cp.get('status')} · "
+                        f"Comprador: {cp.get('comprador') or '—'} · "
+                        f"Valor R$ {float(cp.get('valor_item') or 0):,.2f}"
+                    )
+
 # ====================== ADMINISTRADOR ======================
 elif perfil == "👨‍💼 Administrador":
     if not st.session_state.admin_logado:
-        header("Área do Administrador", "Autentique-se para acessar os painéis", icon="👨‍💼")
+        header(
+            "Área do Administrador",
+            "Autentique-se para acessar os painéis",
+            icon="👨‍💼",
+            nivel="secao",
+        )
         with st.container(border=True):
             with st.form("login_admin"):
                 usuario_input = st.text_input("Usuário:", placeholder="Leandro Coelho")
@@ -1294,7 +993,12 @@ elif perfil == "👨‍💼 Administrador":
                         st.error("❌ Usuário ou senha incorretos.")
                         log_error(f"Tentativa de login admin falhou: {usuario_input}")
     else:
-        header("Painel do Administrador", "Indicadores, cadastros e importações", icon="👨‍💼")
+        header(
+            "Painel do Administrador",
+            "Indicadores, cadastros e importações",
+            icon="👨‍💼",
+            nivel="secao",
+        )
         col_a, col_b, col_c = st.columns([5, 2, 1])
         col_a.success("🔓 Sessão administrativa ativa.")
         with col_b:
@@ -1304,7 +1008,6 @@ elif perfil == "👨‍💼 Administrador":
                         ok, msg = sync_local_to_cloud()
                     if ok:
                         st.success(msg)
-                        reload_data()
                     else:
                         st.error(msg)
             else:
@@ -1316,12 +1019,20 @@ elif perfil == "👨‍💼 Administrador":
 
         reload_data()
         df = pd.DataFrame(st.session_state.chamados) if st.session_state.chamados else pd.DataFrame()
+        compras_all = carregar_compras()
+        df_compras = pd.DataFrame(compras_all) if compras_all else pd.DataFrame()
+        hist_all = carregar_historico_manutencao()
+        df_custos = custo_e_horas_por_equipamento(
+            historico=hist_all,
+            chamados=st.session_state.chamados,
+        )
 
-        tab1, tab2, tab3, tab4, tab5, tab6, tab7, tab8, tab9 = st.tabs([
+        tab1, tab2, tab3, tab4, tab_comp, tab5, tab6, tab7, tab8, tab9 = st.tabs([
             "📊 Dashboard Geral",
             "📈 Análise Gráfica",
             "📊 Análise de Tempo",
             "🛠️ Ocorrências por Equipamento",
+            "🛒 Compras & Índices",
             "👥 Cadastro de Equipe",
             "🏭 Cadastro de Setores",
             "🔧 Cadastro de Equipamentos",
@@ -1330,54 +1041,196 @@ elif perfil == "👨‍💼 Administrador":
         ])
 
         with tab1:
+            st.subheader("📊 Painel consolidado")
+            # ---- KPIs Chamados ----
             if not df.empty:
                 df = df.copy()
-                df["data_hora_abertura"] = pd.to_datetime(df["data_hora_abertura"], errors="coerce")
+                df["data_hora_abertura"] = pd.to_datetime(
+                    df["data_hora_abertura"], errors="coerce"
+                )
                 with st.container(border=True):
                     colf1, colf2, colf3, colf4 = st.columns(4)
                     with colf1:
                         filtro_setor = st.multiselect(
-                            "Setor", sorted(df["setor"].dropna().unique()), key="f1"
+                            "Setor",
+                            sorted(df["setor"].dropna().unique().tolist()),
+                            key="f1",
                         )
                     with colf2:
                         filtro_prioridade = st.multiselect(
-                            "Prioridade", df["prioridade"].dropna().unique(), key="f2"
+                            "Prioridade",
+                            df["prioridade"].dropna().unique().tolist(),
+                            key="f2",
                         )
                     with colf3:
                         filtro_status = st.multiselect(
                             "Status",
-                            ["Aberto", "Em Atendimento", "Concluído"],
+                            ["Aberto", "Em Atendimento", "Aguardando Peça", "Concluído"],
                             key="f3",
                         )
                     with colf4:
                         filtro_tecnico = st.multiselect(
-                            "Técnico", df["executante"].dropna().unique(), key="f4"
+                            "Técnico",
+                            [x for x in df["executante"].dropna().unique().tolist() if x],
+                            key="f4",
                         )
                 df_filtrado = df.copy()
                 if filtro_setor:
                     df_filtrado = df_filtrado[df_filtrado["setor"].isin(filtro_setor)]
                 if filtro_prioridade:
-                    df_filtrado = df_filtrado[df_filtrado["prioridade"].isin(filtro_prioridade)]
+                    df_filtrado = df_filtrado[
+                        df_filtrado["prioridade"].isin(filtro_prioridade)
+                    ]
                 if filtro_status:
                     df_filtrado = df_filtrado[df_filtrado["status"].isin(filtro_status)]
                 if filtro_tecnico:
-                    df_filtrado = df_filtrado[df_filtrado["executante"].isin(filtro_tecnico)]
+                    df_filtrado = df_filtrado[
+                        df_filtrado["executante"].isin(filtro_tecnico)
+                    ]
+            else:
+                df_filtrado = df
 
-                m1, m2, m3, m4 = st.columns(4)
-                m1.metric("Total", len(df_filtrado))
-                m2.metric("Abertos", len(df_filtrado[df_filtrado["status"] == "Aberto"]))
-                m3.metric(
-                    "Em Atendimento",
-                    len(df_filtrado[df_filtrado["status"] == "Em Atendimento"]),
+            n_total = len(df_filtrado) if not df_filtrado.empty else 0
+            n_ab = (
+                len(df_filtrado[df_filtrado["status"] == "Aberto"])
+                if n_total
+                else 0
+            )
+            n_at = (
+                len(df_filtrado[df_filtrado["status"] == "Em Atendimento"])
+                if n_total
+                else 0
+            )
+            n_ap = (
+                len(df_filtrado[df_filtrado["status"] == "Aguardando Peça"])
+                if n_total
+                else 0
+            )
+            n_ok = (
+                len(df_filtrado[df_filtrado["status"] == "Concluído"])
+                if n_total
+                else 0
+            )
+            taxa_conc = (n_ok / n_total * 100) if n_total else 0
+
+            st.markdown("##### Chamados")
+            k1, k2, k3, k4, k5, k6 = st.columns(6)
+            k1.metric("Total", n_total)
+            k2.metric("Abertos", n_ab)
+            k3.metric("Em atendimento", n_at)
+            k4.metric("Aguard. peça", n_ap)
+            k5.metric("Concluídos", n_ok)
+            k6.metric("Taxa conclusão", f"{taxa_conc:.0f}%")
+
+            # ---- KPIs Compras ----
+            n_cp = len(df_compras)
+            n_pend = (
+                len(df_compras[df_compras["status"] == "Pendente"]) if n_cp else 0
+            )
+            n_apr = (
+                len(df_compras[df_compras["status"] == "Aprovada"]) if n_cp else 0
+            )
+            n_rec = (
+                len(df_compras[df_compras["status"] == "Recebida"]) if n_cp else 0
+            )
+            n_rej = (
+                len(df_compras[df_compras["status"] == "Rejeitada"]) if n_cp else 0
+            )
+            valor_total = (
+                float(df_compras["valor_item"].fillna(0).sum()) if n_cp else 0.0
+            )
+            lead = (
+                float(
+                    df_compras.loc[
+                        df_compras["status"].isin(["Aprovada", "Recebida"]),
+                        "dias_para_chegada",
+                    ]
+                    .dropna()
+                    .mean()
                 )
-                m4.metric("Concluídos", len(df_filtrado[df_filtrado["status"] == "Concluído"]))
+                if n_cp and "dias_para_chegada" in df_compras.columns
+                else 0.0
+            )
+
+            st.markdown("##### Compras de peças")
+            c1, c2, c3, c4, c5, c6 = st.columns(6)
+            c1.metric("Solicitações", n_cp)
+            c2.metric("Pendentes", n_pend)
+            c3.metric("Aprovadas", n_apr)
+            c4.metric("Recebidas", n_rec)
+            c5.metric("Rejeitadas", n_rej)
+            c6.metric("Valor total", f"R$ {valor_total:,.2f}")
+
+            m1, m2, m3 = st.columns(3)
+            m1.metric("Lead time médio (dias)", f"{lead:.1f}" if lead else "—")
+            m2.metric(
+                "Custo peças (histórico manut.)",
+                f"R$ {df_custos['Custo Peças (R$)'].sum():,.2f}"
+                if not df_custos.empty
+                else "R$ 0,00",
+            )
+            m3.metric(
+                "Horas-homem total",
+                f"{df_custos['Horas-Homem'].sum():.1f} h"
+                if not df_custos.empty
+                else "0 h",
+            )
+
+            # ---- Listagem aprimorada ----
+            st.markdown("##### Listagem de chamados")
+            if not df_filtrado.empty:
+                cols_show = [
+                    c
+                    for c in [
+                        "id",
+                        "status",
+                        "prioridade",
+                        "setor",
+                        "equipamento",
+                        "solicitante",
+                        "executante",
+                        "data_hora_abertura",
+                        "data_hora_inicio",
+                        "data_hora_conclusao",
+                        "peca_solicitada",
+                        "descricao",
+                        "solucao_descricao",
+                        "comentario_conclusao",
+                    ]
+                    if c in df_filtrado.columns
+                ]
+                df_view = df_filtrado[cols_show].copy()
+                for col in [
+                    "data_hora_abertura",
+                    "data_hora_inicio",
+                    "data_hora_conclusao",
+                ]:
+                    if col in df_view.columns:
+                        df_view[col] = pd.to_datetime(
+                            df_view[col], errors="coerce"
+                        ).dt.strftime("%d/%m/%Y %H:%M")
+                df_view = df_view.sort_values("id", ascending=False)
                 st.dataframe(
-                    df_filtrado.drop(columns=["foto_path", "foto_solucao_path"], errors="ignore"),
+                    df_view,
                     use_container_width=True,
                     hide_index=True,
+                    column_config={
+                        "id": st.column_config.NumberColumn("OS", width="small"),
+                        "status": st.column_config.TextColumn("Status", width="medium"),
+                        "prioridade": st.column_config.TextColumn("Prioridade", width="small"),
+                        "descricao": st.column_config.TextColumn("Descrição", width="large"),
+                    },
+                )
+                csv = df_view.to_csv(index=False).encode("utf-8-sig")
+                st.download_button(
+                    "⬇️ Exportar chamados (CSV)",
+                    data=csv,
+                    file_name=f"chamados_{datetime.now().strftime('%Y%m%d')}.csv",
+                    mime="text/csv",
+                    key="dl_chamados_dash",
                 )
             else:
-                st.info("Nenhum chamado registrado.")
+                st.info("Nenhum chamado registrado / filtrado.")
 
         with tab2:
             if not df.empty:
@@ -1392,6 +1245,16 @@ elif perfil == "👨‍💼 Administrador":
                         color_discrete_map=CORES_PRIORIDADE,
                     )
                     st.plotly_chart(fig, use_container_width=True)
+                    if "status" in df.columns:
+                        fig_s = px.pie(
+                            df,
+                            names="status",
+                            color="status",
+                            title="Distribuição por Status",
+                            hole=0.4,
+                            color_discrete_map=CORES_STATUS,
+                        )
+                        st.plotly_chart(fig_s, use_container_width=True)
                 with col2:
                     setor_df = df["setor"].value_counts().reset_index()
                     setor_df.columns = ["setor", "count"]
@@ -1400,11 +1263,79 @@ elif perfil == "👨‍💼 Administrador":
                         x="setor",
                         y="count",
                         title="Chamados por Setor",
-                        color_discrete_sequence=["#2563EB"],
+                        color_discrete_sequence=["#ef4444"],
                     )
                     st.plotly_chart(fig, use_container_width=True)
+                    if "executante" in df.columns:
+                        tec_df = (
+                            df[df["executante"].fillna("").astype(str).str.len() > 0][
+                                "executante"
+                            ]
+                            .value_counts()
+                            .reset_index()
+                        )
+                        tec_df.columns = ["tecnico", "count"]
+                        if not tec_df.empty:
+                            fig_t = px.bar(
+                                tec_df,
+                                x="tecnico",
+                                y="count",
+                                title="Chamados por Técnico",
+                                color_discrete_sequence=["#f59e0b"],
+                            )
+                            st.plotly_chart(fig_t, use_container_width=True)
+                # Evolução temporal
+                df_t = df.copy()
+                df_t["data_hora_abertura"] = pd.to_datetime(
+                    df_t["data_hora_abertura"], errors="coerce"
+                )
+                df_t = df_t.dropna(subset=["data_hora_abertura"])
+                if not df_t.empty:
+                    df_t["dia"] = df_t["data_hora_abertura"].dt.date
+                    evol = df_t.groupby("dia").size().reset_index(name="chamados")
+                    fig_e = px.line(
+                        evol,
+                        x="dia",
+                        y="chamados",
+                        markers=True,
+                        title="Aberturas por dia",
+                    )
+                    st.plotly_chart(fig_e, use_container_width=True)
             else:
                 st.info("Sem dados para gráficos.")
+
+            if not df_compras.empty and "status" in df_compras.columns:
+                st.markdown("##### Compras")
+                g1, g2 = st.columns(2)
+                with g1:
+                    st.plotly_chart(
+                        px.pie(
+                            df_compras,
+                            names="status",
+                            title="Compras por status",
+                            hole=0.4,
+                        ),
+                        use_container_width=True,
+                    )
+                with g2:
+                    if "valor_item" in df_compras.columns:
+                        top_itens = (
+                            df_compras.groupby("item_nome")["valor_item"]
+                            .sum()
+                            .reset_index()
+                            .sort_values("valor_item", ascending=False)
+                            .head(10)
+                        )
+                        st.plotly_chart(
+                            px.bar(
+                                top_itens,
+                                x="item_nome",
+                                y="valor_item",
+                                title="Top itens por valor (R$)",
+                                color_discrete_sequence=["#ef4444"],
+                            ),
+                            use_container_width=True,
+                        )
 
         with tab3:
             st.subheader("📊 Análise de Tempo de Execução")
@@ -1457,15 +1388,158 @@ elif perfil == "👨‍💼 Administrador":
                 st.info("Ainda não há chamados concluídos para análise.")
 
         with tab4:
+            st.subheader("🛠️ Ocorrências e Custos por Equipamento")
+            hist_all = carregar_historico_manutencao()
+            df_custos = custo_e_horas_por_equipamento(
+                historico=hist_all,
+                chamados=st.session_state.chamados,
+            )
+
             if not df.empty:
-                df_equip = df.groupby("equipamento").size().reset_index(name="Total")
+                df_equip = df.groupby("equipamento").size().reset_index(name="Chamados")
+                st.markdown("**Chamados por equipamento**")
                 st.dataframe(
-                    df_equip.sort_values("Total", ascending=False),
+                    df_equip.sort_values("Chamados", ascending=False),
                     use_container_width=True,
                     hide_index=True,
                 )
             else:
-                st.info("Sem dados.")
+                st.info("Sem chamados registrados.")
+
+            st.markdown("**Custo de manutenção e horas-homem**")
+            if not df_custos.empty:
+                c1, c2, c3 = st.columns(3)
+                c1.metric("Custo total peças", f"R$ {df_custos['Custo Peças (R$)'].sum():,.2f}")
+                c2.metric("Horas-homem total", f"{df_custos['Horas-Homem'].sum():,.1f} h")
+                c3.metric("Equipamentos com histórico", len(df_custos))
+                st.dataframe(df_custos, use_container_width=True, hide_index=True)
+                fig = px.bar(
+                    df_custos.head(15),
+                    x="Equipamento",
+                    y="Custo Peças (R$)",
+                    color="Horas-Homem",
+                    title="Top equipamentos por custo de peças",
+                    color_continuous_scale="Reds",
+                )
+                st.plotly_chart(fig, use_container_width=True)
+            else:
+                st.info(
+                    "Ainda não há histórico de manutenções com custo/horas. "
+                    "Registre preventivas nos alertas ou adicione no cadastro do equipamento."
+                )
+
+        with tab_comp:
+            st.subheader("🛒 Compras — tabela e índices")
+            if df_compras.empty:
+                st.info("Nenhuma solicitação de compra registrada ainda.")
+            else:
+                df_c = df_compras.copy()
+                # Índices
+                total_c = len(df_c)
+                aprov_c = len(df_c[df_c["status"].isin(["Aprovada", "Recebida"])])
+                taxa_apr = (aprov_c / total_c * 100) if total_c else 0
+                valor_sum = float(df_c["valor_item"].fillna(0).sum()) if "valor_item" in df_c.columns else 0
+                valor_medio = float(df_c["valor_item"].fillna(0).mean()) if total_c else 0
+                lead_medio = (
+                    float(
+                        df_c.loc[
+                            df_c["status"].isin(["Aprovada", "Recebida"]),
+                            "dias_para_chegada",
+                        ]
+                        .dropna()
+                        .mean()
+                    )
+                    if "dias_para_chegada" in df_c.columns
+                    else 0
+                )
+
+                i1, i2, i3, i4, i5 = st.columns(5)
+                i1.metric("Total solicitações", total_c)
+                i2.metric("Taxa aprovação", f"{taxa_apr:.0f}%")
+                i3.metric("Valor total", f"R$ {valor_sum:,.2f}")
+                i4.metric("Valor médio", f"R$ {valor_medio:,.2f}")
+                i5.metric("Lead time médio", f"{lead_medio:.1f} d" if lead_medio else "—")
+
+                # Tabela formatada
+                cols_cp = [
+                    c
+                    for c in [
+                        "id",
+                        "status",
+                        "aprovado",
+                        "item_nome",
+                        "equipamento",
+                        "prioridade",
+                        "chamado_id",
+                        "solicitante",
+                        "comprador",
+                        "prazo_recebimento",
+                        "dias_para_chegada",
+                        "valor_item",
+                        "link_compra",
+                        "data_solicitacao",
+                        "data_aprovacao",
+                        "data_recebimento",
+                        "observacao",
+                        "observacao_compras",
+                    ]
+                    if c in df_c.columns
+                ]
+                df_cv = df_c[cols_cp].copy()
+                if "valor_item" in df_cv.columns:
+                    df_cv["valor_item"] = df_cv["valor_item"].fillna(0).round(2)
+                df_cv = df_cv.sort_values("id", ascending=False)
+                st.dataframe(
+                    df_cv,
+                    use_container_width=True,
+                    hide_index=True,
+                    column_config={
+                        "id": st.column_config.NumberColumn("ID", width="small"),
+                        "chamado_id": st.column_config.NumberColumn("OS", width="small"),
+                        "valor_item": st.column_config.NumberColumn(
+                            "Valor R$", format="R$ %.2f"
+                        ),
+                        "link_compra": st.column_config.LinkColumn("Link"),
+                        "status": st.column_config.TextColumn("Status", width="medium"),
+                    },
+                )
+                st.download_button(
+                    "⬇️ Exportar compras (CSV)",
+                    data=df_cv.to_csv(index=False).encode("utf-8-sig"),
+                    file_name=f"compras_{datetime.now().strftime('%Y%m%d')}.csv",
+                    mime="text/csv",
+                    key="dl_compras_admin",
+                )
+
+                # Ranking itens / equipamentos
+                st.markdown("##### Rankings")
+                r1, r2 = st.columns(2)
+                with r1:
+                    if "item_nome" in df_c.columns:
+                        rank_item = (
+                            df_c.groupby("item_nome")
+                            .agg(
+                                qtd=("id", "count"),
+                                valor=("valor_item", "sum"),
+                            )
+                            .reset_index()
+                            .sort_values("qtd", ascending=False)
+                        )
+                        st.markdown("**Itens mais solicitados**")
+                        st.dataframe(rank_item, use_container_width=True, hide_index=True)
+                with r2:
+                    if "equipamento" in df_c.columns:
+                        rank_eq = (
+                            df_c.groupby("equipamento")
+                            .agg(
+                                qtd=("id", "count"),
+                                valor=("valor_item", "sum"),
+                            )
+                            .reset_index()
+                            .sort_values("valor", ascending=False)
+                        )
+                        st.markdown("**Gasto por equipamento**")
+                        st.dataframe(rank_eq, use_container_width=True, hide_index=True)
 
         with tab5:
             st.subheader("👥 Cadastro da Equipe de Manutenção")
@@ -1480,8 +1554,10 @@ elif perfil == "👨‍💼 Administrador":
                     if st.form_submit_button("Cadastrar Membro", type="primary"):
                         if nome and nome.strip():
                             if adicionar_membro_equipe(nome.strip(), funcao, contato):
-                                st.success(f"{nome} cadastrado!")
-                                reload_data()
+                                agendar_efeito_concluido(
+                                    f"✅ Membro {nome.strip()} cadastrado!",
+                                    celebrar=True,
+                                )
                                 st.rerun()
                         else:
                             st.error("Informe o nome.")
@@ -1498,7 +1574,6 @@ elif perfil == "👨‍💼 Administrador":
                             if st.button("🗑️ Excluir", key=f"del_eq_{i}"):
                                 mid = row.get("id")
                                 if mid is not None and excluir_membro_equipe(int(mid)):
-                                    reload_data()
                                     st.rerun()
             else:
                 st.info("Nenhum membro cadastrado.")
@@ -1522,18 +1597,21 @@ elif perfil == "👨‍💼 Administrador":
                                 try:
                                     idx = lista.index(st.session_state.edit_setor)
                                     lista[idx] = novo_setor.strip()
-                                    st.success("Setor atualizado!")
+                                    msg_setor = f"✅ Setor '{novo_setor.strip()}' atualizado!"
                                 except ValueError:
                                     lista.append(novo_setor.strip())
+                                    msg_setor = f"✅ Setor '{novo_setor.strip()}' adicionado!"
                                 st.session_state.edit_setor = None
                             else:
                                 if novo_setor.strip() not in lista:
                                     lista.append(novo_setor.strip())
-                                    st.success(f"Setor '{novo_setor}' adicionado!")
+                                    msg_setor = f"✅ Setor '{novo_setor.strip()}' cadastrado!"
                                 else:
                                     st.warning("Setor já existe.")
+                                    msg_setor = None
                             if salvar_setores(lista):
-                                reload_data()
+                                if msg_setor:
+                                    agendar_efeito_concluido(msg_setor, celebrar=True)
                                 st.rerun()
 
             setores_filtrados = (
@@ -1553,7 +1631,6 @@ elif perfil == "👨‍💼 Administrador":
                     if st.button("🗑️ Excluir", key=f"del_s_{i}"):
                         lista = [s for s in st.session_state.setores if s != setor]
                         if salvar_setores(lista):
-                            reload_data()
                             st.rerun()
 
         with tab7:
@@ -1633,16 +1710,28 @@ elif perfil == "👨‍💼 Administrador":
                                     datetime.now() + timedelta(days=sazonalidade * 30)
                                 )
                                 .date()
-                                .isoformat(),
+                                .isoformat()
+                                if not edit
+                                else edit.get(
+                                    "proxima_preventiva",
+                                    (
+                                        datetime.now()
+                                        + timedelta(days=sazonalidade * 30)
+                                    )
+                                    .date()
+                                    .isoformat(),
+                                ),
+                                "silenciar_ate": edit.get("silenciar_ate")
+                                if edit
+                                else None,
                             }
                             if salvar_equipamento(novo):
                                 st.session_state.edit_equip = None
-                                st.success(
-                                    "Equipamento atualizado!"
-                                    if edit
-                                    else "Equipamento cadastrado!"
+                                agendar_efeito_concluido(
+                                    f"✅ Equipamento '{nome.strip()}' "
+                                    + ("atualizado!" if edit else "cadastrado!"),
+                                    celebrar=True,
                                 )
-                                reload_data()
                                 st.rerun()
                         else:
                             st.error("Nome e patrimônio são obrigatórios.")
@@ -1660,8 +1749,115 @@ elif perfil == "👨‍💼 Administrador":
             )
             for i, eq in enumerate(equipamentos_filtrados):
                 nome_eq = nome_equipamento(eq)
-                with st.expander(f"{nome_eq} - Pat: {eq.get('numero_patrimonio', 'N/A')}"):
-                    st.write(eq)
+                eq_id = eq.get("id")
+                hist_eq = carregar_historico_manutencao(eq_id)
+                custo_eq = sum(float(h.get("custo_pecas") or 0) for h in hist_eq)
+                horas_eq = sum(float(h.get("horas_homem") or 0) for h in hist_eq)
+                n_hist = len(hist_eq)
+                label = (
+                    f"{nome_eq} · Pat {eq.get('numero_patrimonio', 'N/A')} "
+                    f"· 🔧 {n_hist} · R$ {custo_eq:,.0f} · {horas_eq:.1f}h"
+                )
+                with st.expander(label):
+                    # Resumo cadastral
+                    c_a, c_b, c_c = st.columns(3)
+                    with c_a:
+                        st.markdown(f"**Marca / Modelo**\n\n{eq.get('marca') or '—'} / {eq.get('modelo') or '—'}")
+                        st.markdown(f"**Setor**\n\n{eq.get('setor') or '—'}")
+                    with c_b:
+                        st.markdown(f"**Ano**\n\n{eq.get('ano_aquisicao') or '—'}")
+                        st.markdown(f"**Sazonalidade**\n\n{eq.get('sazonalidade_meses') or 6} meses")
+                    with c_c:
+                        st.markdown(f"**Última preventiva**\n\n{eq.get('ultima_preventiva') or '—'}")
+                        st.markdown(f"**Próxima**\n\n{eq.get('proxima_preventiva') or '—'}")
+                        if eq.get("silenciar_ate"):
+                            st.caption(f"🔕 Alerta silenciado até {eq.get('silenciar_ate')}")
+
+                    m1, m2, m3 = st.columns(3)
+                    m1.metric("Custo peças", f"R$ {custo_eq:,.2f}")
+                    m2.metric("Horas-homem", f"{horas_eq:.1f} h")
+                    m3.metric("Registros", n_hist)
+
+                    st.markdown("#### 📋 Histórico de manutenções")
+                    if hist_eq:
+                        for h in hist_eq:
+                            tipo = h.get("tipo") or "—"
+                            data_h = h.get("data_manutencao") or "—"
+                            st.markdown(
+                                f"""
+                                <div style="padding:8px 12px;margin:4px 0;border-radius:10px;
+                                            border:1px solid #333;background:#111;border-left:3px solid #dc2626;">
+                                    <b style="color:#f1f1f1;">{tipo}</b>
+                                    <span style="color:#a3a3a3;"> · {data_h}</span><br/>
+                                    <span style="color:#ddd;">{h.get('descricao') or ''}</span><br/>
+                                    <span style="color:#a3a3a3;font-size:0.85rem;">
+                                        👤 {h.get('executante') or '—'} ·
+                                        🔩 {h.get('pecas_trocadas') or '—'} ·
+                                        💰 R$ {float(h.get('custo_pecas') or 0):,.2f} ·
+                                        ⏱ {float(h.get('horas_homem') or 0):.1f} h
+                                    </span>
+                                </div>
+                                """,
+                                unsafe_allow_html=True,
+                            )
+                    else:
+                        st.caption("Nenhuma manutenção registrada ainda.")
+
+                    with st.popover("➕ Registrar manutenção", key=f"pop_hist_{eq_id}_{i}"):
+                        tipo_m = st.selectbox(
+                            "Tipo",
+                            ["Preventiva", "Corretiva", "Preditiva", "Outros"],
+                            key=f"hist_tipo_{eq_id}_{i}",
+                        )
+                        exec_m = st.text_input("Executante", key=f"hist_exec_{eq_id}_{i}")
+                        desc_m = st.text_area("Descrição", key=f"hist_desc_{eq_id}_{i}")
+                        pecas_m = st.text_input("Peças trocadas", key=f"hist_pecas_{eq_id}_{i}")
+                        cc1, cc2 = st.columns(2)
+                        with cc1:
+                            custo_m = st.number_input(
+                                "Custo peças (R$)", min_value=0.0, step=10.0, key=f"hist_custo_{eq_id}_{i}"
+                            )
+                        with cc2:
+                            horas_m = st.number_input(
+                                "Horas-homem", min_value=0.0, step=0.5, key=f"hist_horas_{eq_id}_{i}"
+                            )
+                        obs_m = st.text_input("Observação", key=f"hist_obs_{eq_id}_{i}")
+                        if st.button("💾 Salvar registro", key=f"hist_save_{eq_id}_{i}", type="primary"):
+                            if tipo_m == "Preventiva":
+                                ok = concluir_preventiva(
+                                    eq,
+                                    executante=exec_m or "",
+                                    descricao=desc_m or "Manutenção preventiva",
+                                    pecas=pecas_m or "",
+                                    custo_pecas=float(custo_m or 0),
+                                    horas_homem=float(horas_m or 0),
+                                    observacao=obs_m or "",
+                                )
+                            else:
+                                reg = {
+                                    "id": proximo_id_manutencao(),
+                                    "equipamento_id": eq_id,
+                                    "equipamento_nome": nome_eq,
+                                    "tipo": tipo_m,
+                                    "data_manutencao": datetime.now().strftime(
+                                        "%Y-%m-%d %H:%M:%S"
+                                    ),
+                                    "executante": exec_m,
+                                    "descricao": desc_m,
+                                    "pecas_trocadas": pecas_m,
+                                    "custo_pecas": float(custo_m or 0),
+                                    "horas_homem": float(horas_m or 0),
+                                    "chamado_id": None,
+                                    "observacao": obs_m,
+                                }
+                                ok = salvar_manutencao(reg)
+                            if ok:
+                                agendar_efeito_concluido(
+                                    f"✅ Manutenção ({tipo_m}) registrada!",
+                                    celebrar=True,
+                                )
+                                st.rerun()
+
                     col1, col2 = st.columns(2)
                     with col1:
                         if st.button("✏️ Editar", key=f"edit_eq_{i}"):
@@ -1669,8 +1865,7 @@ elif perfil == "👨‍💼 Administrador":
                             st.rerun()
                     with col2:
                         if st.button("🗑️ Excluir", key=f"del_eqp_{i}"):
-                            if excluir_equipamento(int(eq.get("id"))):
-                                reload_data()
+                            if excluir_equipamento(int(eq_id)):
                                 st.rerun()
 
         with tab8:
