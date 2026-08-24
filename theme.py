@@ -318,6 +318,57 @@ def aplicar_tema():
             transform: translateY(-1px);
         }
 
+        /* ===== Feedback de sucesso ===== */
+        .fx-sucesso {
+            display: flex;
+            align-items: center;
+            gap: 14px;
+            margin: 0 0 1.1rem 0;
+            padding: 14px 18px;
+            border-radius: 14px;
+            border: 1px solid rgba(34, 197, 94, 0.45);
+            border-left: 5px solid #22c55e;
+            background: linear-gradient(135deg, rgba(22, 101, 52, 0.35), rgba(20, 83, 45, 0.15));
+            box-shadow:
+                0 0 0 1px rgba(34, 197, 94, 0.12),
+                0 12px 28px -12px rgba(34, 197, 94, 0.35);
+            animation: fx-sucesso-in 0.45s ease-out, fx-sucesso-pulse 2.2s ease-in-out 0.45s 2;
+        }
+        .fx-sucesso-icone {
+            flex-shrink: 0;
+            width: 42px; height: 42px;
+            display: flex; align-items: center; justify-content: center;
+            font-size: 1.35rem;
+            border-radius: 12px;
+            background: rgba(34, 197, 94, 0.2);
+            border: 1px solid rgba(34, 197, 94, 0.4);
+        }
+        .fx-sucesso-titulo {
+            font-size: 0.75rem;
+            font-weight: 700;
+            letter-spacing: 0.06em;
+            text-transform: uppercase;
+            color: #86efac;
+            margin-bottom: 2px;
+        }
+        .fx-sucesso-msg {
+            font-size: 0.98rem;
+            font-weight: 600;
+            color: #f0fdf4;
+            line-height: 1.35;
+        }
+        @keyframes fx-sucesso-in {
+            from { opacity: 0; transform: translateY(-10px) scale(0.98); }
+            to   { opacity: 1; transform: translateY(0) scale(1); }
+        }
+        @keyframes fx-sucesso-pulse {
+            0%, 100% { box-shadow: 0 0 0 1px rgba(34, 197, 94, 0.12), 0 12px 28px -12px rgba(34, 197, 94, 0.35); }
+            50%      { box-shadow: 0 0 0 1px rgba(34, 197, 94, 0.25), 0 12px 32px -8px rgba(34, 197, 94, 0.55); }
+        }
+        @media (prefers-reduced-motion: reduce) {
+            .fx-sucesso { animation: none !important; }
+        }
+
         /* ===== Badges ===== */
         .badge {
             padding: 5px 14px;
